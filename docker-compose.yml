@@ -1,0 +1,50 @@
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# AsyncFlow Engine — Docker Compose (Development)
+#
+# Spins up only the infrastructure services.  The FastAPI app and RQ worker
+# are run locally (not containerised) during development to preserve hot-reload
+# and debugger access.
+#
+# Usage:
+#   docker-compose up -d          # Start Redis in the background
+#   docker-compose down           # Stop and remove containers
+#   docker-compose logs -f redis  # Tail Redis logs
+# ---------------------------------------------------------------------------
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: asyncflow_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Optional: Redis Insight UI for inspecting the queue during development
+  redis-insight:
+    image: redislabs/redisinsight:latest
+    container_name: asyncflow_redis_insight
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles:
+      - debug  # Only starts with: docker-compose --profile debug up
+
+volumes:
+  redis_data:
+    driver: local

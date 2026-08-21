@@ -1,0 +1,5 @@
+# Ignore everything in this folder from the parent repo
+*
+!.gitignore
+!README.md
+!v0.0_report.md
