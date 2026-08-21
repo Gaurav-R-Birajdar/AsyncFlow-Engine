@@ -47,10 +47,11 @@ router = APIRouter()
 
 _RQ_STATUS_MAP: dict[JobStatus, WorkflowStatus] = {
     JobStatus.QUEUED:    WorkflowStatus.QUEUED,
+    JobStatus.CREATED:   WorkflowStatus.QUEUED,    # RQ 2.x: job created but not yet queued
     JobStatus.STARTED:   WorkflowStatus.RUNNING,
     JobStatus.FINISHED:  WorkflowStatus.COMPLETED,
     JobStatus.FAILED:    WorkflowStatus.FAILED,
-    JobStatus.STOPPED:   WorkflowStatus.CANCELLED,
+    JobStatus.CANCELED:  WorkflowStatus.CANCELLED, # RQ 2.x: single-L American spelling
     JobStatus.DEFERRED:  WorkflowStatus.QUEUED,
     JobStatus.SCHEDULED: WorkflowStatus.QUEUED,
 }
@@ -219,9 +220,9 @@ async def get_workflow_status(
     redis_conn = request.app.state.redis_conn
     job = _fetch_job(task_id, redis_conn)
 
-    # workflow_name is stored in job.kwargs (the original call arguments)
-    kwargs: dict = job.kwargs or {}
-    request_dict: dict = kwargs.get("request_dict", {})
+    # RQ stores positional args in job.args (tuple), not job.kwargs.
+    # queue.enqueue(process_workflow, payload_dict) → job.args = (payload_dict,)
+    request_dict: dict = (job.args[0] if job.args else None) or job.kwargs.get("request_dict", {})
     workflow_name: str = request_dict.get("workflow_name", "unknown")
 
     return _build_status_response(job, workflow_name)

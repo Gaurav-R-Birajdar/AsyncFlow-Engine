@@ -236,13 +236,10 @@ class WorkflowSubmitRequest(BaseModel):
         list[WorkflowStep],
         Field(min_length=1, max_length=20, description="Ordered list of steps to execute"),
     ]
-    metadata: Annotated[
-        dict[str, str],
-        Field(
-            default_factory=dict,
-            description="Arbitrary caller-supplied key-value pairs (tracing, tagging, etc.)",
-        ),
-    ] = {}
+    metadata: dict[str, str] = Field(
+        default_factory=dict,
+        description="Arbitrary caller-supplied key-value pairs (tracing, tagging, etc.)",
+    )
 
     # ------------------------------------------------------------------
     # Validators

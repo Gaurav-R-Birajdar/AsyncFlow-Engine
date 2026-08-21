@@ -1,0 +1,34 @@
+{
+  "workflow_name": "test-pipeline",
+  "input_text": "The quarterly earnings exceeded all analyst expectations.",
+  "steps": [
+    {
+      "step_id": "step_summarize",
+      "config": {
+        "task_type": "summarize",
+        "max_words": 100
+      }
+    },
+    {
+      "step_id": "step_translate",
+      "config": {
+        "task_type": "translate",
+        "target_language": "fr"
+      }
+    },
+    {
+      "step_id": "step_extract",
+      "config": {
+        "task_type": "extract_json",
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "result": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

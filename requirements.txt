@@ -1,24 +1,29 @@
 # ---------------------------------------------------------------------------
-# AsyncFlow Engine — Python Dependencies
-# Pin minor versions for reproducibility; allow patch updates.
+# AsyncFlow Engine — Python Dependencies (V0.2 — Locked)
+#
+# Minimum version pins (>=) chosen deliberately:
+#   - Avoids breaking changes from old releases
+#   - Allows patch-level security updates without manual intervention
+#   - RQ 1.15+ required for JobStatus enum (used in routes.py mapping table)
+#   - Pydantic 2.4+ required for model_dump(mode="json") datetime serialisation
+#   - pydantic-settings 2.0.3+ required for SettingsConfigDict
 # ---------------------------------------------------------------------------
 
 # --- Web Framework ----------------------------------------------------------
-fastapi==0.115.*
-uvicorn[standard]==0.30.*          # ASGI server with HTTP/1.1 + WebSocket support
+fastapi>=0.103.0
+uvicorn[standard]>=0.23.2          # [standard] pulls websockets + httptools
 
 # --- Data Validation --------------------------------------------------------
-pydantic==2.8.*
-pydantic-settings==2.4.*           # .env file loading for Settings
+pydantic>=2.4.0
+pydantic-settings>=2.0.3           # .env file loading for Settings class
 
 # --- Queue / Redis ----------------------------------------------------------
-rq==1.16.*                         # Redis Queue — simple, robust job queue
-redis==5.0.*                       # Async-compatible Redis client
+rq>=1.15.0                         # JobStatus enum introduced in 1.15
+redis>=5.0.0                       # Async-compatible client; used by RQ + routes
 
 # --- LLM Client (Phase 2) ---------------------------------------------------
-httpx==0.27.*                      # Async HTTP client for Ollama API calls
+httpx>=0.25.0                      # Async HTTP for Ollama API calls
 
 # --- Dev / Testing ----------------------------------------------------------
-pytest==8.3.*
-pytest-asyncio==0.23.*
-httpx                              # Also used by TestClient
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
