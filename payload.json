@@ -1,33 +1,39 @@
 {
-  "workflow_name": "test-pipeline",
-  "input_text": "The quarterly earnings exceeded all analyst expectations.",
+  "workflow_name": "phase2-full-pipeline-test",
+  "input_text": "The company reported Q3 revenue of $4.2 billion, up 18% year-over-year. Operating margins expanded to 24%, driven by cloud services growth. The board approved a $500M share buyback program.",
   "steps": [
     {
       "step_id": "step_summarize",
       "config": {
         "task_type": "summarize",
-        "max_words": 100
+        "max_words": 60,
+        "style": "bullet points"
       }
     },
     {
-      "step_id": "step_translate",
+      "step_id": "step_sentiment",
       "config": {
-        "task_type": "translate",
-        "target_language": "fr"
+        "task_type": "sentiment",
+        "granularity": "document"
       }
     },
     {
       "step_id": "step_extract",
+      "retry_on_failure": true,
+      "input_override": "The company reported Q3 revenue of $4.2 billion, up 18% year-over-year. Operating margins expanded to 24%, driven by cloud services growth. The board approved a $500M share buyback program.",
       "config": {
         "task_type": "extract_json",
         "output_schema": {
           "type": "object",
           "properties": {
-            "result": {
-              "type": "string"
-            }
-          }
-        }
+            "revenue_billion_usd": {"type": "number"},
+            "yoy_growth_pct": {"type": "number"},
+            "operating_margin_pct": {"type": "number"},
+            "buyback_million_usd": {"type": "number"}
+          },
+          "required": ["revenue_billion_usd", "yoy_growth_pct", "operating_margin_pct", "buyback_million_usd"]
+        },
+        "strict": true
       }
     }
   ]

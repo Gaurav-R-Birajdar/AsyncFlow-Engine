@@ -1,5 +1,5 @@
 """
-AsyncFlow Engine — RQ Background Worker Tasks.
+AsyncFlow Engine — RQ Background Worker Tasks (Phase 2 — LLM Connected).
 
 This module defines the functions that RQ workers deserialise from Redis
 and execute in a separate process.  Functions here MUST be:
@@ -7,21 +7,28 @@ and execute in a separate process.  Functions here MUST be:
   - serialisable by pickle (all arguments must be plain dicts / primitives)
   - self-contained (bring in their own logger, not shared state)
 
-Phase 1 — Simulation Mode:
-  The Ollama engine is NOT yet connected.  ``process_workflow`` iterates over
-  the workflow steps and sleeps for 2 seconds per step to simulate LLM latency.
-  This lets us validate the full state-machine (Queued → Running → Completed/Failed)
-  before introducing real GPU compute.
+Phase 2 — Real LLM Mode:
+  The Ollama engine is fully connected.  ``process_workflow`` calls
+  ``prompts.build_prompt()`` to construct a task-specific system instruction,
+  then passes the resulting ``PromptPackage`` to ``LLMEngine.generate()``
+  (or ``LLMEngine.generate_json()`` for EXTRACT_JSON steps).
 
-Phase 2 note:
-  Replace the ``_simulate_step`` call with ``LLMEngine().generate(prompt)``
-  and the sleep with the actual HTTP round-trip.  No other changes needed.
+  Sequential execution is enforced by the RQ SimpleWorker — only one
+  ``process_workflow`` call runs at a time, which means only one Ollama
+  inference runs at a time.  This is intentional: it prevents two context
+  windows from competing for the RTX 5060's 8 GB VRAM budget.
+
+Fault model:
+  - ``LLMConnectionError``   → step FAILED, workflow aborted, remaining steps SKIPPED
+  - ``LLMTimeoutError``      → step FAILED (retry_on_failure allowed)
+  - ``LLMMalformedResponseError`` → step FAILED (retry_on_failure re-attempts once)
+  - Any other ``Exception``  → step FAILED with full traceback string as error
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,67 +36,76 @@ from app.core.schemas import (
     StepResult,
     StepStatus,
     TaskType,
-    WorkflowStep,
     WorkflowSubmitRequest,
+    WorkflowStep,
 )
+from app.worker.engine import (
+    LLMConnectionError,
+    LLMEngine,
+    LLMMalformedResponseError,
+    LLMTimeoutError,
+)
+from app.worker.prompts import PromptPackage, build_prompt
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Simulation helpers
+# LLM execution helpers
 # ---------------------------------------------------------------------------
 
 
-_SIMULATED_LATENCY_SECONDS: float = 2.0
-"""Per-step sleep duration that mimics local LLM inference time."""
-
-
-def _simulate_step(step: WorkflowStep, input_text: str) -> str:
+def _run_llm_step(engine: LLMEngine, step: WorkflowStep, input_text: str) -> str:
     """
-    Produce a deterministic mock output for a single workflow step.
+    Dispatch a single step through the LLM engine.
 
-    Why task-type-specific messages?
-      Realistic-looking output makes it immediately obvious which step is
-      being simulated when reading logs or API responses — far easier to
-      debug than a generic "step completed" string.
+    Why separate from the retry loop in ``process_workflow``?
+      Keeping the dispatch clean allows the retry loop to call this function
+      multiple times without duplicating prompt construction.
 
     Args:
-        step: The validated ``WorkflowStep`` object.
-        input_text: The chained input from the previous step (or seed text).
+        engine:     A reused ``LLMEngine`` instance for this workflow run.
+        step:       The typed ``WorkflowStep`` (config determines prompt strategy).
+        input_text: Chained input from the previous step (or seed text).
 
     Returns:
-        A short mock string representing the step's "output".
+        The LLM's output as a string.
+        For EXTRACT_JSON steps, this is a ``json.dumps()``-serialised dict so
+        the output can chain into the next step as text.
+
+    Raises:
+        LLMConnectionError:       Ollama unreachable — unrecoverable for this run.
+        LLMTimeoutError:          Response timed out — retryable.
+        LLMMalformedResponseError: JSON decode failed — retryable when strict=True.
     """
-    task_type = step.config.task_type
-    preview = input_text[:80].replace("\n", " ")
+    pkg: PromptPackage = build_prompt(step, input_text)
 
-    _mock_outputs: dict[TaskType, str] = {
-        TaskType.SUMMARIZE: (
-            f"[SIMULATED SUMMARY] Key points extracted from: '{preview}...'"
-        ),
-        TaskType.TRANSLATE: (
-            f"[SIMULATED TRANSLATION → {getattr(step.config, 'target_language', '??')}] "
-            f"Translated content of: '{preview}...'"
-        ),
-        TaskType.EXTRACT_JSON: (
-            '{{"simulated": true, "extracted_from": "' + preview[:40] + '..."}}'
-        ),
-        TaskType.CLASSIFY: (
-            f"[SIMULATED CLASSIFICATION] Label assigned to: '{preview}...'"
-        ),
-        TaskType.SENTIMENT: (
-            f"[SIMULATED SENTIMENT] positive (confidence: 0.87) for: '{preview}...'"
-        ),
-        TaskType.CUSTOM_PROMPT: (
-            f"[SIMULATED CUSTOM OUTPUT] Prompt applied to: '{preview}...'"
-        ),
-    }
-
-    return _mock_outputs.get(
-        task_type,
-        f"[SIMULATED] Unknown task type '{task_type}' — output placeholder.",
+    logger.debug(
+        "Step '%s' -> task_type=%s | json_mode=%s | temperature=%s | max_tokens=%s",
+        step.step_id,
+        step.config.task_type,
+        pkg.use_json_mode,
+        pkg.temperature,
+        pkg.max_tokens,
     )
+
+    if pkg.use_json_mode:
+        # EXTRACT_JSON path — returns a parsed dict, normalise to string
+        schema = getattr(step.config, "output_schema", None)
+        parsed: dict[str, Any] = engine.generate_json(
+            prompt=pkg.user,
+            system=pkg.system,
+            schema=schema,
+            options={"temperature": pkg.temperature, "num_predict": pkg.max_tokens},
+        )
+        return json.dumps(parsed, ensure_ascii=False, indent=2)
+    else:
+        # All other task types — plain text completion
+        return engine.generate(
+            prompt=pkg.user,
+            system=pkg.system,
+            options={"temperature": pkg.temperature, "num_predict": pkg.max_tokens},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +115,7 @@ def _simulate_step(step: WorkflowStep, input_text: str) -> str:
 
 def process_workflow(request_dict: dict[str, Any]) -> dict[str, Any]:
     """
-    RQ worker entry point — simulate a full multi-step workflow execution.
+    RQ worker entry point — execute a multi-step workflow via the local LLM.
 
     This function runs in a **separate worker process** spawned by ``rq worker``.
     It must not rely on any FastAPI app state, async event loops, or shared
@@ -107,15 +123,18 @@ def process_workflow(request_dict: dict[str, Any]) -> dict[str, Any]:
 
     Execution model:
       1. Deserialise ``request_dict`` into a typed ``WorkflowSubmitRequest``.
-      2. For each step (in order):
+      2. Instantiate ``LLMEngine`` once per workflow (avoids repeated object
+         construction overhead; Ollama itself is stateless between calls).
+      3. For each step (in order):
          a. Record ``started_at``.
-         b. Sleep ``_SIMULATED_LATENCY_SECONDS`` to mimic LLM inference.
+         b. Call ``_run_llm_step()`` — blocks until Ollama responds.
          c. If ``input_override`` is set, use it; otherwise chain from the
             previous step's output (or the seed ``input_text`` for step 1).
          d. Record ``finished_at`` and append a ``StepResult``.
-         e. If a step raises an exception and ``retry_on_failure`` is True,
-            attempt once more before marking the step as FAILED.
-      3. Return a serialisable dict with all ``StepResult`` objects and the
+         e. If a step raises and ``retry_on_failure=True``, attempt once more.
+         f. ``LLMConnectionError`` bypasses the retry loop — it is fatal for
+            the entire workflow (Ollama is down; retrying won't help).
+      4. Return a serialisable dict with all ``StepResult`` objects and the
          ``final_output`` of the last successful step.
 
     Args:
@@ -131,8 +150,8 @@ def process_workflow(request_dict: dict[str, Any]) -> dict[str, Any]:
     Raises:
         ValueError: If ``request_dict`` fails Pydantic validation (schema drift).
     """
-    # Reconstruct the typed model inside the worker — validates the payload
-    # again in case the schema was updated between enqueue and execution.
+    # Reconstruct typed model inside the worker — re-validates the payload
+    # in case the schema changed between enqueue and execution.
     try:
         request = WorkflowSubmitRequest(**request_dict)
     except Exception as exc:
@@ -145,6 +164,8 @@ def process_workflow(request_dict: dict[str, Any]) -> dict[str, Any]:
         len(request.steps),
     )
 
+    # One engine instance per workflow — Ollama is stateless between calls
+    engine = LLMEngine()
     step_results: list[dict[str, Any]] = []
     current_input: str = request.input_text  # Seed text for the first step
 
@@ -157,7 +178,7 @@ def process_workflow(request_dict: dict[str, Any]) -> dict[str, Any]:
             step.config.task_type,
         )
 
-        # Honour input_override — useful for injecting external context
+        # Honour input_override — useful for injecting external context mid-chain
         step_input = step.input_override if step.input_override else current_input
 
         result = StepResult(
@@ -168,14 +189,13 @@ def process_workflow(request_dict: dict[str, Any]) -> dict[str, Any]:
 
         attempt = 0
         max_attempts = 2 if step.retry_on_failure else 1
+        connection_fatal = False  # LLMConnectionError bypasses retry
 
         while attempt < max_attempts:
             attempt += 1
             try:
-                # --- Simulate LLM latency -----------------------------------
-                time.sleep(_SIMULATED_LATENCY_SECONDS)
+                output = _run_llm_step(engine, step, step_input)
 
-                output = _simulate_step(step, step_input)
                 result.status = StepStatus.COMPLETED
                 result.output = output
                 result.finished_at = datetime.now(timezone.utc)
@@ -190,38 +210,57 @@ def process_workflow(request_dict: dict[str, Any]) -> dict[str, Any]:
                 )
                 break  # Success — exit retry loop
 
-            except Exception as exc:
+            except LLMConnectionError as exc:
+                # Ollama is down — retrying this step won't help.
+                # Abort the entire workflow immediately.
+                logger.error(
+                    "[%d/%d] Step '%s' — LLM unreachable (fatal): %s",
+                    idx,
+                    len(request.steps),
+                    step.step_id,
+                    exc,
+                )
+                result.status = StepStatus.FAILED
+                result.error = f"LLMConnectionError: {exc}"
+                result.finished_at = datetime.now(timezone.utc)
+                connection_fatal = True
+                break
+
+            except (LLMTimeoutError, LLMMalformedResponseError, Exception) as exc:
+                exc_label = type(exc).__name__
                 logger.warning(
-                    "[%d/%d] Step '%s' failed on attempt %d/%d: %s",
+                    "[%d/%d] Step '%s' failed on attempt %d/%d (%s): %s",
                     idx,
                     len(request.steps),
                     step.step_id,
                     attempt,
                     max_attempts,
+                    exc_label,
                     exc,
                 )
                 if attempt >= max_attempts:
                     result.status = StepStatus.FAILED
-                    result.error = str(exc)
+                    result.error = f"{exc_label}: {exc}"
                     result.finished_at = datetime.now(timezone.utc)
 
-        # Append result (whether success or failure)
-        # Serialise via model_dump(mode="json") to handle datetime → ISO string
+        # Append result — model_dump(mode="json") converts datetimes → ISO strings
         step_results.append(result.model_dump(mode="json"))
 
         if result.status == StepStatus.FAILED:
             # Mark all remaining steps as SKIPPED and abort the chain
+            reason = "LLM unreachable" if connection_fatal else f"step '{step.step_id}' failed"
             logger.error(
-                "Step '%s' failed. Skipping remaining %d step(s).",
+                "Step '%s' failed. Skipping remaining %d step(s). Reason: %s",
                 step.step_id,
                 len(request.steps) - idx,
+                reason,
             )
             for skipped_step in request.steps[idx:]:
                 step_results.append(
                     StepResult(
                         step_id=skipped_step.step_id,
                         status=StepStatus.SKIPPED,
-                        error=f"Skipped because step '{step.step_id}' failed.",
+                        error=f"Skipped because {reason}.",
                     ).model_dump(mode="json")
                 )
             break

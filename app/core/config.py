@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3.1"
     OLLAMA_REQUEST_TIMEOUT: int = 120  # seconds
+    OLLAMA_MAX_TOKENS: int = 4096  # Hard num_predict cap — guards RTX 5060 8 GB KV-cache budget
+    OLLAMA_TEMPERATURE_DEFAULT: float = 0.3  # Fallback; per-task prompts.py overrides this
 
     # --- FastAPI ------------------------------------------------------------
     APP_ENV: str = "development"  # "development" | "staging" | "production"
