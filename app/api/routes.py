@@ -1,9 +1,12 @@
 """
-AsyncFlow Engine — API Routes.
+AsyncFlow Engine — API Routes (v0.6.0: DLQ Replay Mechanism).
 
 Endpoints:
-  POST /workflow/submit           — Validate payload, enqueue to RQ, return job_id.
+  POST /workflow/submit           — Validate payload, enqueue to RQ (with Retry + DLQ), return job_id.
   GET  /workflow/{task_id}/status — Fetch live job status and results from RQ/Redis.
+  GET  /workflow/dlq              — Inspect all permanently failed payloads from asyncflow:dlq (paginated).
+  GET  /dlq                       — Top-level alias with pagination (mounted directly on app in main.py).
+  POST /dlq/replay                — Phase 3: drain DLQ and re-enqueue all failed jobs as fresh RQ tasks.
 
 Dependency pattern:
   Both endpoints access ``request.app.state`` for Redis/RQ objects that were
@@ -18,15 +21,25 @@ RQ ↔ AsyncFlow status mapping:
   RQ "stopped"  → WorkflowStatus.CANCELLED
   RQ "deferred" → WorkflowStatus.QUEUED
   RQ "scheduled"→ WorkflowStatus.QUEUED
+
+Retry + DLQ wiring (v0.5.0):
+  ``submit_workflow`` now passes ``retry=Retry(max=3, interval=[2,4,8])`` and
+  ``on_failure=route_to_dlq`` to every ``queue.enqueue()`` call.  This means:
+    - RQ automatically retries failed jobs up to 3 times with exponential delays.
+    - After the final failure, ``route_to_dlq`` pushes the payload + traceback
+      to the ``asyncflow:dlq`` Redis list.
+  The ``GET /dlq`` endpoint surfaces all DLQ entries for manual inspection.
 """
 
+import json
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from rq.exceptions import NoSuchJobError
-from rq.job import Job, JobStatus
+from rq.job import Job, JobStatus, Retry
 
+from app.core.config import settings
 from app.core.schemas import (
     StepResult,
     StepStatus,
@@ -35,6 +48,7 @@ from app.core.schemas import (
     WorkflowSubmitRequest,
     WorkflowSubmitResponse,
 )
+from app.worker.dlq import route_to_dlq
 from app.worker.queue_tasks import process_workflow
 
 logger = logging.getLogger(__name__)
@@ -163,19 +177,33 @@ async def submit_workflow(
     """
     queue = request.app.state.queue
 
+    # Build retry policy: exponential backoff, values read from settings.
+    # Retry(max=3, interval=[2, 4, 8]) — RQ will wait 2s, then 4s, then 8s
+    # between consecutive retry attempts.  After 3 retries, on_failure fires.
+    retry_policy = Retry(
+        max=settings.RQ_RETRY_MAX,
+        interval=settings.RQ_RETRY_INTERVALS,
+    )
+
     try:
         # Serialise to a plain dict — Pydantic V2 model_dump with json mode
         # ensures datetimes, enums, etc. are all JSON-serialisable primitives.
         job = queue.enqueue(
             process_workflow,
             payload.model_dump(mode="json"),
-            job_id=None,  # Let RQ generate a UUID job ID
+            job_id=None,           # Let RQ generate a UUID job ID
+            retry=retry_policy,    # Exponential backoff: 2s, 4s, 8s
+            on_failure=route_to_dlq,  # Push to asyncflow:dlq on final failure
         )
+        # Telemetry: [QUEUED] — job accepted into the Redis queue.
         logger.info(
-            "Workflow '%s' enqueued as job '%s' with %d step(s).",
+            "[QUEUED] Workflow '%s' enqueued as job '%s' with %d step(s). "
+            "Retry policy: max=%d, intervals=%s.",
             payload.workflow_name,
             job.id,
             len(payload.steps),
+            settings.RQ_RETRY_MAX,
+            settings.RQ_RETRY_INTERVALS,
         )
     except Exception as exc:
         logger.error("Failed to enqueue workflow '%s': %s", payload.workflow_name, exc)
@@ -226,3 +254,80 @@ async def get_workflow_status(
     workflow_name: str = request_dict.get("workflow_name", "unknown")
 
     return _build_status_response(job, workflow_name)
+
+
+# ---------------------------------------------------------------------------
+# Dead-Letter Queue inspection endpoint
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/dlq",
+    summary="Inspect permanently failed workflow payloads",
+    tags=["Dead-Letter Queue"],
+)
+async def get_dlq_entries(
+    request: Request,
+    limit: int = Query(
+        default=None,
+        ge=1,
+        le=1000,
+        description="Max DLQ entries to return (newest-first). Defaults to DLQ_MAX_ENTRIES setting.",
+    ),
+) -> list[dict]:
+    """
+    Fetch all entries from the ``asyncflow:dlq`` Redis list.
+
+    Each entry represents a workflow job that exhausted all RQ retry attempts
+    and was routed to the Dead-Letter Queue by ``route_to_dlq``.
+
+    Entry schema:
+    ::
+
+        {
+          "job_id":        str,
+          "workflow_name": str | null,
+          "enqueued_at":   str (ISO-8601) | null,
+          "failed_at":     str (ISO-8601),
+          "attempt":       int,
+          "traceback":     str,
+          "payload":       dict
+        }
+
+    Returns:
+        A list of DLQ entry dicts, ordered newest-first (LPUSH head is index 0).
+        Returns an empty list if no entries exist.
+
+    Raises:
+        HTTPException(503): If Redis is unreachable during the fetch.
+    """
+    redis_conn = request.app.state.redis_conn
+    dlq_key: str = settings.DLQ_REDIS_KEY
+    cap: int = limit if limit is not None else settings.DLQ_MAX_ENTRIES
+
+    try:
+        # LRANGE 0 (cap-1) returns at most `cap` entries without blocking.
+        raw_entries: list[bytes] = redis_conn.lrange(dlq_key, 0, cap - 1)
+    except Exception as exc:
+        logger.error("Redis error while fetching DLQ key '%s': %s", dlq_key, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not read from the Dead-Letter Queue. Ensure Redis is running.",
+        )
+
+    parsed: list[dict] = []
+    for raw in raw_entries:
+        try:
+            parsed.append(json.loads(raw))
+        except (json.JSONDecodeError, TypeError) as exc:
+            # Malformed entry — log and surface as a placeholder rather than crashing.
+            logger.warning("DLQ entry could not be decoded: %s | raw: %r", exc, raw)
+            parsed.append({"error": "malformed DLQ entry", "raw": str(raw)})
+
+    logger.info(
+        "GET /dlq — returned %d DLQ entr%s from key '%s'.",
+        len(parsed),
+        "y" if len(parsed) == 1 else "ies",
+        dlq_key,
+    )
+    return parsed

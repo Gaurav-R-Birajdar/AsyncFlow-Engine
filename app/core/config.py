@@ -3,6 +3,14 @@ AsyncFlow Engine — Environment Configuration.
 
 All external service coordinates are read from environment variables so that
 no secrets are ever baked into source code (12-Factor App principle).
+
+Phase 2 additions (v0.5.0):
+  - RQ_RETRY_MAX: number of RQ-level job retries before DLQ routing.
+  - RQ_RETRY_INTERVALS: list of per-retry delay seconds (exponential backoff).
+  - DLQ_REDIS_KEY: Redis list name for permanently failed job payloads.
+
+Patch (v0.5.1):
+  - DLQ_MAX_ENTRIES: upper bound on entries returned by GET /dlq (default 500).
 """
 
 from functools import lru_cache
@@ -22,6 +30,16 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     RQ_QUEUE_NAME: str = "asyncflow_default"
     JOB_TIMEOUT: int = 600  # seconds — max allowed worker runtime per job
+
+    # --- Retry & Dead-Letter Queue (Phase 2 — v0.5.0) -----------------------
+    # Number of RQ-level job retries before routing to DLQ.
+    # Delays follow exponential backoff: 2s -> 4s -> 8s (guards GPU bottlenecks).
+    RQ_RETRY_MAX: int = 3
+    RQ_RETRY_INTERVALS: list[int] = [2, 4, 8]
+    # Redis list key where permanently failed job payloads are stored.
+    DLQ_REDIS_KEY: str = "asyncflow:dlq"
+    # Patch v0.5.1: max entries returned by GET /dlq to prevent large wire transfers.
+    DLQ_MAX_ENTRIES: int = 500
 
     # --- Ollama / Local LLM -------------------------------------------------
     OLLAMA_BASE_URL: str = "http://localhost:11434"

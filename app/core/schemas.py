@@ -1,5 +1,5 @@
 """
-AsyncFlow Engine — Pydantic Schemas (V1).
+AsyncFlow Engine — Pydantic Schemas (v0.6.0).
 
 This file is the single source of truth for every JSON shape that crosses
 the API boundary.  All models use strict validation so malformed payloads
@@ -320,3 +320,30 @@ class WorkflowStatusResponse(BaseModel):
     submitted_at: datetime | None = None
     completed_at: datetime | None = None
     error: str | None = Field(default=None, description="Top-level error if the workflow failed")
+
+
+class DlqReplayResponse(BaseModel):
+    """
+    Response payload for ``POST /dlq/replay``.
+
+    Provides a precise audit of the replay operation so the caller knows
+    exactly how many jobs were re-admitted to the active queue and how many
+    were skipped due to malformed data.
+    """
+
+    requeued: int = Field(
+        description="Number of DLQ jobs successfully pushed back into the active RQ queue."
+    )
+    skipped: int = Field(
+        description="Number of DLQ entries that could not be re-enqueued (malformed JSON or missing payload)."
+    )
+    total_processed: int = Field(
+        description="Total DLQ entries drained during this replay (requeued + skipped)."
+    )
+    message: str = Field(
+        description="Human-readable summary of the replay operation."
+    )
+    skipped_details: list[str] = Field(
+        default_factory=list,
+        description="Short error descriptions for each skipped entry, for diagnostic purposes."
+    )
