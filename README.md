@@ -1,10 +1,10 @@
-﻿# AsyncFlow Engine
+# AsyncFlow Engine
 
-> A production-grade, multi-step LLM workflow orchestration engine built with **FastAPI**, **Redis Queue (RQ)**, and a local **Ollama / Llama 3.1** inference server — with enterprise-grade resilience via exponential-backoff retry, a Redis Dead-Letter Queue (DLQ), and a one-call DLQ Replay mechanism.
+> A production-grade, multi-step LLM workflow orchestration engine built with **FastAPI**, **Redis Queue (RQ)**, and a local **Ollama / Llama 3.1** inference server — with enterprise-grade resilience via exponential-backoff retry, a Redis Dead-Letter Queue (DLQ), a one-call DLQ Replay mechanism, and an MCP Governance Interceptor that redacts PII from LLM outputs before they propagate downstream.
 
-Submit a JSON payload describing a chain of NLP tasks. The engine validates it, queues it in Redis, executes each step sequentially through the local LLM, retries transient failures automatically, routes permanently failed jobs to a Dead-Letter Queue for inspection, and lets an admin replay them back into the live queue — all without blocking the original caller.
+Submit a JSON payload describing a chain of NLP tasks. The engine validates it, queues it in Redis, executes each step sequentially through the local LLM, intercepts structured JSON outputs to enforce PII policy, retries transient failures automatically, routes permanently failed jobs to a Dead-Letter Queue for inspection, and lets an admin replay them back into the live queue — all without blocking the original caller.
 
-[![Version](https://img.shields.io/badge/version-0.6.1-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-green)](https://fastapi.tiangolo.com/)
 [![Redis](https://img.shields.io/badge/Redis-7-red)](https://redis.io/)
@@ -22,11 +22,12 @@ Submit a JSON payload describing a chain of NLP tasks. The engine validates it, 
 7. [Payload Chaining & input_override](#7-payload-chaining--input_override)
 8. [Phase 2 — Exponential Backoff Retry](#8-phase-2--exponential-backoff-retry)
 9. [Phase 3 — Dead-Letter Queue & Replay](#9-phase-3--dead-letter-queue--replay)
-10. [Fault Model (Complete)](#10-fault-model-complete)
-11. [Hardware Constraints](#11-hardware-constraints)
-12. [Environment Variables](#12-environment-variables)
-13. [Example End-to-End Run](#13-example-end-to-end-run)
-14. [Component Status](#14-component-status)
+10. [Phase 2 — MCP Governance Interceptor](#10-phase-2--mcp-governance-interceptor)
+11. [Fault Model (Complete)](#11-fault-model-complete)
+12. [Hardware Constraints](#12-hardware-constraints)
+13. [Environment Variables](#13-environment-variables)
+14. [Example End-to-End Run](#14-example-end-to-end-run)
+15. [Component Status](#15-component-status)
 
 ---
 
@@ -69,11 +70,17 @@ Submit a JSON payload describing a chain of NLP tasks. The engine validates it, 
 |      prompts.build_prompt(step, input) -> PromptPackage                     |
 |      LLMEngine.generate() or .generate_json() -> Ollama                     |
 |                                                                              |
-|      on LLMConnectionError: log, record FAILED, raise -> RQ retry           |
-|      on Timeout/Malformed: retry step if retry_on_failure=True, else raise   |
+|      [EXTRACT_JSON / CUSTOM_PROMPT only -- if GOVERNANCE_ENABLED=true]       |
+|      GovernanceInterceptor.parse_and_sanitize(output)  <- Phase 2 SAM       |
+|        detects PII keys -> redacts with [REDACTED_BY_POLICY]                |
+|        emits [GOVERNANCE_INTERCEPT] telemetry if redaction occurred          |
+|      AuditLogger.log_event() -> data/audit.jsonl  (append-only JSONL)       |
 |                                                                              |
-|  on job exception -> retries_left > 0  -> re-enqueue (2s, 4s, 8s backoff)  |
-|                   -> retries_left == 0 -> route_to_dlq() LPUSH asyncflow:dlq|
+|      on LLMConnectionError: log, record FAILED, raise -> RQ retry           |
+|      on Timeout/Malformed/GovernanceError: retry if retry_on_failure=True    |
+|                                                                              |
+|  on job exception -> retries_left > 0  ->  re-enqueue (2s, 4s, 8s backoff)  |
+|                   -> retries_left == 0 ->  route_to_dlq() LPUSH asyncflow:dlq|
 +--------------------------------------+---------------------------------------+
                                        |  HTTP POST /api/generate
                                        v
@@ -103,11 +110,16 @@ AsyncFlow Engine/
 |   +-- core/
 |   |   +-- config.py         # pydantic-settings, reads .env, lru_cache singleton
 |   |   +-- schemas.py        # Pydantic V2 models, single source of truth for all JSON shapes
+|   +-- governance/           # Phase 2: MCP Governance Interceptor (SAM layer)
+|   |   +-- interceptor.py    # GovernanceInterceptor, EnterpriseToolPayload, GovernanceError
+|   |   +-- audit.py          # AuditLogger — append-only JSONL writer to data/audit.jsonl
 |   +-- worker/
 |       +-- engine.py         # LLMEngine, Ollama HTTP client, retry on 5xx
 |       +-- prompts.py        # build_prompt(), per-task system instruction builders
-|       +-- queue_tasks.py    # process_workflow(), RQ entry point, chaining, fatal re-raise
+|       +-- queue_tasks.py    # process_workflow(), RQ entry point, governance injection
 |       +-- dlq.py            # route_to_dlq() on_failure callback; replay_dlq() Phase 3
++-- data/
+|   +-- audit.jsonl           # Append-only PII audit trail (gitignored — runtime only)
 +-- run_worker.py             # Windows-compatible SimpleWorker launcher, retry/DLQ wiring
 +-- docker-compose.yml        # Redis 7-Alpine + optional RedisInsight
 +-- payload.json              # Ready-to-run 3-step demo payload
@@ -306,7 +318,7 @@ Drain the DLQ and requeue every entry as a fresh job with a reset retry counter.
 ### GET /health
 
 ```json
-{ "status": "ok", "version": "0.6.1" }
+{ "status": "ok", "version": "1.0.0" }
 ```
 
 ---
@@ -480,13 +492,14 @@ Total backoff window: **14 seconds** (2+4+8) before DLQ routing.
 
 ### Worker Telemetry Tags
 
-| Tag | Where | Meaning |
-|---|---|---|
-| `[QUEUED]` | `routes.py` | Job accepted into Redis queue |
-| `[PROCESSING]` | `queue_tasks.py` | Worker started executing |
-| `[RETRYING]` | `run_worker.py` | RQ re-queuing with backoff delay |
-| `[DLQ-SENT]` | `dlq.py` | Final failure; payload pushed to `asyncflow:dlq` |
-| `[REPLAY]` | `dlq.py`, `main.py` | Admin replay triggered; jobs re-enqueued |
+| Tag | Level | Where | Meaning |
+|---|---|---|---|
+| `[QUEUED]` | INFO | `routes.py` | Job accepted into Redis queue |
+| `[PROCESSING]` | INFO | `queue_tasks.py` | Worker started executing |
+| `[RETRYING]` | WARNING | `run_worker.py` | RQ re-queuing with backoff delay |
+| `[GOVERNANCE_INTERCEPT]` | **WARNING** | `queue_tasks.py` | PII detected and redacted in step output |
+| `[DLQ-SENT]` | ERROR | `dlq.py` | Final failure; payload pushed to `asyncflow:dlq` |
+| `[REPLAY]` | INFO | `dlq.py`, `main.py` | Admin replay triggered; jobs re-enqueued |
 
 ### Configuration
 
@@ -608,15 +621,110 @@ while True:
 
 ---
 
-## 10. Fault Model (Complete)
+## 10. Phase 2 — MCP Governance Interceptor
+
+### What Is It?
+
+The **MCP Governance Interceptor** is a middleware layer — modelled after a SAM (Sensitive-data Access Management) layer — that sits between `_run_llm_step()` output and downstream step chaining inside `process_workflow`.
+
+For every `EXTRACT_JSON` and `CUSTOM_PROMPT` step, the raw LLM JSON is:
+1. Parsed and validated against an `EnterpriseToolPayload` Pydantic schema.
+2. Recursively scanned for PII keys at any nesting depth.
+3. Sensitive values replaced with `[REDACTED_BY_POLICY]` in-place.
+4. Written as one JSONL record to `data/audit.jsonl` (before/after snapshots).
+5. The sanitized version replaces the raw output — the next step **never sees PII**.
+
+### Data Flow
+
+```
+process_workflow()
+    │
+    ├── _run_llm_step()  ──▶  raw_output (JSON string)
+    │
+    ├── [EXTRACT_JSON or CUSTOM_PROMPT + GOVERNANCE_ENABLED=true]
+    │       ▼
+    │   GovernanceInterceptor.parse_and_sanitize(raw_output, step_id)
+    │       ├── json.loads()            ──▶  GovernanceError on JSONDecodeError
+    │       ├── EnterpriseToolPayload() ──▶  GovernanceError on ValidationError
+    │       └── _redact_recursive()     ──▶  (sanitized_dict, redacted_keys)
+    │
+    ├── [redacted_keys non-empty]  ──▶  logger.warning("[GOVERNANCE_INTERCEPT] ...")
+    │
+    ├── AuditLogger.log_event()    ──▶  data/audit.jsonl  (append-only)
+    │
+    └── output = json.dumps(sanitized_dict)  ──▶  next step / final_output
+```
+
+### PII Field Registry
+
+`GovernanceInterceptor` detects the following field names **at any nesting depth**, case-insensitively:
+
+| Category | Fields |
+|---|---|
+| Tax / Identity | `tax_id`, `ssn`, `social_security_number`, `national_id`, `passport_number`, `driver_license` |
+| Personnel | `employee_name`, `full_name`, `date_of_birth`, `dob` |
+| Contact | `email`, `email_address`, `phone`, `phone_number`, `mobile` |
+| Financial | `account_number`, `bank_account`, `credit_card`, `salary`, `compensation` |
+| Network | `ip_address` |
+
+To add a new field: extend `PII_FIELD_NAMES` in `interceptor.py` and declare it in `EnterpriseToolPayload`. No other code changes required.
+
+### Audit Log Schema (`data/audit.jsonl`)
+
+One JSON object per line, UTF-8. The file is **append-only** and **gitignored** — it must be protected by filesystem ACLs in production.
+
+```json
+{
+  "timestamp": "2026-09-23T12:05:31.842193+00:00",
+  "tool_name": "step_extract_employee",
+  "redacted_keys": ["ssn", "employee.tax_id"],
+  "original_payload": {
+    "ssn": "123-45-6789",
+    "employee": { "tax_id": "TX-001" },
+    "department": "Engineering"
+  },
+  "sanitized_payload": {
+    "ssn": "[REDACTED_BY_POLICY]",
+    "employee": { "tax_id": "[REDACTED_BY_POLICY]" },
+    "department": "Engineering"
+  }
+}
+```
+
+> **Security note:** `original_payload` contains raw PII — it is the compliance record. Never commit `data/audit.jsonl` to source control.
+
+### Fault Integration
+
+`GovernanceError(RuntimeError)` is caught by the existing `except (..., Exception)` handler in `process_workflow` and re-raised — activating the identical RQ retry + DLQ routing used for `LLMConnectionError` and `LLMMalformedResponseError`. **No special-casing is needed.**
+
+| Failure Scenario | GovernanceError Trigger | RQ Behaviour |
+|---|---|---|
+| LLM output is not valid JSON | `json.loads()` fails | Retry → DLQ |
+| Pydantic schema validation error | `EnterpriseToolPayload()` fails | Retry → DLQ |
+| `data/audit.jsonl` write fails | `AuditLogger._write_event()` fails | Retry → DLQ |
+
+### Disabling the Interceptor
+
+Set in `.env` for local development — no code changes required:
+
+```ini
+GOVERNANCE_ENABLED=false
+```
+
+When disabled: step output passes through unmodified, no audit write occurs, and the `[GOVERNANCE_INTERCEPT]` tag is never emitted. All other fault machinery (retry, DLQ) is unaffected.
+
+---
+
+## 11. Fault Model (Complete)
 
 ### Step-Level
 
 | Exception | Step Retry | Job-Level Behaviour |
 |---|---|---|
-| `LLMConnectionError` | No | Step FAILED, remaining SKIPPED, exception **re-raised** -> RQ retry/DLQ |
-| `LLMTimeoutError` | Yes (if `retry_on_failure=True`) | Step retried once; on exhaustion, re-raised -> RQ retry/DLQ |
+| `LLMConnectionError` | No | Step FAILED, remaining SKIPPED, exception **re-raised** → RQ retry/DLQ |
+| `LLMTimeoutError` | Yes (if `retry_on_failure=True`) | Step retried once; on exhaustion, re-raised → RQ retry/DLQ |
 | `LLMMalformedResponseError` | Yes (if `retry_on_failure=True`) | Same as timeout |
+| `GovernanceError` | Yes (if `retry_on_failure=True`) | Un-parseable JSON or audit write failure; same retry path as malformed response |
 | Any other `Exception` | Yes (if `retry_on_failure=True`) | Same retry behaviour |
 
 ### Job-Level (RQ)
@@ -630,7 +738,7 @@ while True:
 
 ---
 
-## 11. Hardware Constraints
+## 12. Hardware Constraints
 
 | Constraint | Value | Reason |
 |---|---|---|
@@ -645,7 +753,7 @@ To run on Linux with a larger GPU: switch to `rq.Worker` and increase `OLLAMA_MA
 
 ---
 
-## 12. Environment Variables
+## 13. Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
@@ -661,13 +769,15 @@ To run on Linux with a larger GPU: switch to `rq.Worker` and increase `OLLAMA_MA
 | `OLLAMA_REQUEST_TIMEOUT` | `120` | Per-request HTTP timeout (seconds) |
 | `OLLAMA_MAX_TOKENS` | `4096` | Hard `num_predict` cap (VRAM guard) |
 | `OLLAMA_TEMPERATURE_DEFAULT` | `0.3` | Fallback temperature (overridden per-task by `prompts.py`) |
+| `AUDIT_LOG_PATH` | `data/audit.jsonl` | Path for the append-only JSONL governance audit log |
+| `GOVERNANCE_ENABLED` | `true` | Set to `false` to bypass the PII interceptor in local dev |
 | `APP_ENV` | `development` | Runtime environment tag |
 | `LOG_LEVEL` | `INFO` | Python logging level |
 | `PYTHONUTF8` | (set manually) | Set to `1` on Windows to prevent cp1252 encoding errors |
 
 ---
 
-## 13. Example End-to-End Run
+## 14. Example End-to-End Run
 
 The included `payload.json` runs a 3-step financial analysis pipeline:
 
@@ -728,23 +838,83 @@ curl.exe http://localhost:8000/dlq
 # []
 ```
 
+### Governance Interception (Phase 2 — MCP)
+
+Submit a workflow whose `EXTRACT_JSON` step returns a payload containing PII:
+
+```powershell
+# 1. Submit a governance test workflow
+$body = @'
+{
+  "workflow_name": "governance_test",
+  "input_text": "Employee John Doe, SSN 123-45-6789, Tax ID TX-001, Engineering dept.",
+  "steps": [{
+    "step_id": "step_extract",
+    "config": {
+      "task_type": "extract_json",
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "employee_name": { "type": "string" },
+          "ssn":           { "type": "string" },
+          "tax_id":        { "type": "string" },
+          "department":    { "type": "string" }
+        }
+      }
+    }
+  }]
+}
+'@
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/workflow/submit `
+  -ContentType "application/json" -Body $body
+
+# 2. Poll status
+Invoke-RestMethod -Method Get -Uri "http://localhost:8000/workflow/<task_id>/status" `
+  | ConvertTo-Json -Depth 6
+```
+
+**Expected output** — PII fields are redacted, non-sensitive fields untouched:
+
+```json
+{
+  "step_id": "step_extract",
+  "status": "completed",
+  "output": "{\n  \"employee_name\": \"[REDACTED_BY_POLICY]\",\n  \"department\": \"Engineering\",\n  \"tax_id\": \"[REDACTED_BY_POLICY]\",\n  \"ssn\": \"[REDACTED_BY_POLICY]\"\n}"
+}
+```
+
+**Worker log** — `[GOVERNANCE_INTERCEPT]` tag emitted:
+
+```
+WARNING  [GOVERNANCE_INTERCEPT] Step 'step_extract' — 3 PII field(s) redacted: ['employee_name', 'ssn', 'tax_id']
+```
+
+**Audit log** — inspect `data/audit.jsonl`:
+
+```powershell
+Get-Content data\audit.jsonl | python -m json.tool
+# Shows one JSONL entry with original_payload (raw PII) and sanitized_payload
+```
+
 ---
 
-## 14. Component Status
+## 15. Component Status
 
 | Component | Status | Notes |
 |---|---|---|
-| Pydantic V2 Schemas | Complete | Discriminated union, field validators, unique step IDs, `DlqReplayResponse` |
-| FastAPI Routes | Complete | 202 submit, status polling, full RQ -> WorkflowStatus mapping |
-| Redis / RQ Integration | Complete | AOF persistence, SimpleWorker, fail-fast ping on startup |
-| Prompt Engineering | Complete | Per-task system instruction builders, frozen `PromptPackage` dataclass |
-| LLM Engine (Ollama) | Complete | `generate()`, `generate_json()`, 1 auto-retry on HTTP 5xx |
-| Phase 2 — Exponential Backoff Retry | Complete | `Retry(max=3, interval=[2,4,8])`, `[RETRYING]` telemetry, fatal re-raise fix (v0.6.1) |
-| Phase 3 — Dead-Letter Queue | Complete | `route_to_dlq` on_failure callback, `GET /dlq` inspection with pagination |
-| Phase 3 — DLQ Replay | Complete | `POST /dlq/replay`, atomic RPOP drain, fresh UUID + retry reset, enqueue-failure recovery |
-| Windows Compatibility | Complete | `SimpleWorker`, `PYTHONUTF8=1`, ASCII-only log strings |
-| Docker Infrastructure | Complete | Redis 7-Alpine, AOF, RedisInsight on `--profile debug` |
+| Pydantic V2 Schemas | ✅ Complete | Discriminated union, field validators, unique step IDs, `DlqReplayResponse` |
+| FastAPI Routes | ✅ Complete | 202 submit, status polling, full RQ → WorkflowStatus mapping |
+| Redis / RQ Integration | ✅ Complete | AOF persistence, SimpleWorker, fail-fast ping on startup |
+| Prompt Engineering | ✅ Complete | Per-task system instruction builders, frozen `PromptPackage` dataclass |
+| LLM Engine (Ollama) | ✅ Complete | `generate()`, `generate_json()`, 1 auto-retry on HTTP 5xx |
+| Phase 2 — Exponential Backoff Retry | ✅ Complete | `Retry(max=3, interval=[2,4,8])`, `[RETRYING]` telemetry, fatal re-raise fix (v0.6.1) |
+| Phase 2 — MCP Governance Interceptor | ✅ Complete | `GovernanceInterceptor`, 21-field PII registry, recursive redaction, `[GOVERNANCE_INTERCEPT]` telemetry, `GOVERNANCE_ENABLED` kill-switch |
+| Phase 2 — Governance Audit Logger | ✅ Complete | `AuditLogger`, append-only JSONL at `data/audit.jsonl`, `GovernanceError` on write failure |
+| Phase 3 — Dead-Letter Queue | ✅ Complete | `route_to_dlq` on_failure callback, `GET /dlq` inspection with pagination |
+| Phase 3 — DLQ Replay | ✅ Complete | `POST /dlq/replay`, atomic RPOP drain, fresh UUID + retry reset, enqueue-failure recovery |
+| Windows Compatibility | ✅ Complete | `SimpleWorker`, `PYTHONUTF8=1`, ASCII-only log strings |
+| Docker Infrastructure | ✅ Complete | Redis 7-Alpine, AOF, RedisInsight on `--profile debug` |
 
 ---
 
-*Built with [Google Antigravity IDE](https://antigravity.google.dev) · AsyncFlow Engine v0.6.1*
+*Built with [Google Antigravity IDE](https://antigravity.google.dev) · AsyncFlow Engine v1.0.0*

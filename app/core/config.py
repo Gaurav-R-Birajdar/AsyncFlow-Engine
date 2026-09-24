@@ -11,6 +11,10 @@ Phase 2 additions (v0.5.0):
 
 Patch (v0.5.1):
   - DLQ_MAX_ENTRIES: upper bound on entries returned by GET /dlq (default 500).
+
+Phase 2 — MCP Governance Interceptor (v1.0.0):
+  - AUDIT_LOG_PATH: path to the append-only JSONL audit log file.
+  - GOVERNANCE_ENABLED: kill-switch to bypass the interceptor without a code change.
 """
 
 from functools import lru_cache
@@ -47,6 +51,13 @@ class Settings(BaseSettings):
     OLLAMA_REQUEST_TIMEOUT: int = 120  # seconds
     OLLAMA_MAX_TOKENS: int = 4096  # Hard num_predict cap — guards RTX 5060 8 GB KV-cache budget
     OLLAMA_TEMPERATURE_DEFAULT: float = 0.3  # Fallback; per-task prompts.py overrides this
+
+    # --- Governance Interceptor (Phase 2 — v1.0.0) --------------------------
+    # Path (relative to CWD or absolute) for the append-only JSONL audit log.
+    AUDIT_LOG_PATH: str = "data/audit.jsonl"
+    # Kill-switch: set GOVERNANCE_ENABLED=false in .env to bypass the interceptor
+    # during local development without modifying source code.
+    GOVERNANCE_ENABLED: bool = True
 
     # --- FastAPI ------------------------------------------------------------
     APP_ENV: str = "development"  # "development" | "staging" | "production"

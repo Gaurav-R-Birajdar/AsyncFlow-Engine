@@ -45,3 +45,6 @@ redis_data/
 # Logs
 *.log
 logs/
+
+# Governance — audit logs contain raw PII (original payloads); never commit
+data/audit.jsonl

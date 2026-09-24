@@ -1,5 +1,5 @@
 """
-AsyncFlow Engine — FastAPI Application Instance & Routing (v0.6.0).
+AsyncFlow Engine — FastAPI Application Instance & Routing (v1.0.0).
 
 Responsibilities:
   - Initialise the FastAPI app with metadata.
@@ -13,22 +13,28 @@ Why two Redis objects?
   FastAPI routes access it via ``request.app.state`` — no global singletons,
   no import-time side effects, clean testability.
 
+v1.0.0 additions (Phase 2 — MCP Governance Interceptor):
+  - ``GovernanceInterceptor`` sits between LLM output and step chaining for
+    EXTRACT_JSON and CUSTOM_PROMPT steps; recursively redacts PII field values
+    with ``[REDACTED_BY_POLICY]``.
+  - ``AuditLogger`` writes an append-only JSONL record to ``data/audit.jsonl``
+    for every governance interception event.
+  - ``GOVERNANCE_ENABLED`` kill-switch in config allows bypassing the interceptor
+    in local development without code changes.
+  - Version bumped to ``1.0.0``.
+
+v0.6.1 patch (retained — critical fix):
+  - ``process_workflow`` now re-raises the causal exception after fatal step
+    failures so RQ exponential backoff and DLQ routing activate correctly.
+
 v0.6.0 additions (Phase 3 — DLQ Replay):
   - ``POST /dlq/replay``     — admin endpoint that drains the DLQ and re-enqueues
                                each payload as a fresh RQ job with a reset retry
                                counter (idempotent: atomic RPOP prevents double-requeue).
   - ``DlqReplayResponse``    — new Pydantic schema surfacing requeued/skipped counts.
-  - Version bumped to ``0.6.0``.
 
-v0.5.1 additions (patch over v0.5.0):
-  - ``GET /dlq``          — top-level DLQ inspection endpoint (not under /workflow prefix)
-                            with an optional ``limit`` query parameter for pagination.
-  - ``_on_job_retried``   — RQ SimpleWorker retry callback now properly wired in run_worker.py.
-  - ``DLQ_MAX_ENTRIES``   — new config cap (default 500) for max DLQ entries returned.
-  - Version string bumped to ``0.5.1``.
-
-v0.5.0 additions (retained):
-  - ``GET /workflow/dlq`` — inspect permanently failed payloads from asyncflow:dlq.
+v0.5.0–v0.5.1 additions (retained):
+  - ``GET /workflow/dlq`` / ``GET /dlq`` — DLQ inspection endpoints.
   - RQ Retry with exponential backoff (2s/4s/8s) wired at enqueue time.
   - ``route_to_dlq`` registered as on_failure callback for all jobs.
 """
@@ -124,12 +130,14 @@ app = FastAPI(
     description=(
         "A high-throughput async workflow orchestration engine. "
         "Submit multi-step LLM pipelines and poll their status in real time. "
-        "v0.6.1: Critical fix — LLM connection failures now correctly re-raise exceptions "
+        "v1.0.0 (Phase 2): MCP Governance Interceptor — PII redaction and append-only "
+        "audit logging for structured LLM outputs before downstream propagation. "
+        "v0.6.1 fix: LLM connection failures now correctly re-raise exceptions "
         "so RQ exponential backoff and DLQ routing activate as designed. "
         "v0.6.0 (Phase 3): DLQ Replay Mechanism — POST /dlq/replay re-enqueues "
         "failed jobs as fresh RQ tasks with reset retry counters."
     ),
-    version="0.6.1",
+    version="1.0.0",
     lifespan=lifespan,
 )
 

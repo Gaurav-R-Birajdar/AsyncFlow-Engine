@@ -3,6 +3,35 @@
 All notable changes to AsyncFlow Engine are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v1.0.1] — 2026-09-24
+
+### Fixed
+- `app/main.py` — Version constant corrected `0.6.1` → `1.0.0`; `/health` now returns `{"version": "1.0.0"}`; module docstring updated to reflect Phase 2 MCP Governance additions.
+- `app/core/config.py` — Two `Phase 4` labels corrected to `Phase 2` in docstring and inline comment.
+- `app/governance/__init__.py` — Docstring label corrected: `Phase 4` → `Phase 2: MCP Governance Interceptor`.
+- `app/governance/interceptor.py` — Module docstring label corrected: `Phase 4` → `Phase 2`.
+- `app/governance/audit.py` — Module docstring label corrected: `Phase 4` → `Phase 2`.
+- `app/worker/queue_tasks.py` — Three `Phase 4` references corrected to `Phase 2` (telemetry tag comment, docstring section header, inline governance block comment).
+- `CHANGELOG.md` — v1.0.0 entry: three `Phase 4` labels in Added/Changed items corrected to `Phase 2`.
+- `README.md` — `GET /health` example response corrected: `"version": "0.6.1"` → `"version": "1.0.0"`.
+- `reports/v1.0.0_report.md` — Report title and summary: `Phase 4` → `Phase 2`.
+
+---
+
+## [v1.0.0] — 2026-09-23
+
+### Added
+- `app/governance/__init__.py` — New `governance` package registration module.
+- `app/governance/interceptor.py` — **Phase 2 core**: `GovernanceError(RuntimeError)` custom exception that feeds into the standard RQ retry + DLQ fault path; `PII_FIELD_NAMES` frozenset (21 canonical sensitive field names, case-insensitive); `EnterpriseToolPayload(BaseModel)` Pydantic schema declaring all PII fields as `str | None = None` with `extra='allow'` so partial matches are caught without rejecting arbitrary LLM output shapes; `GovernanceInterceptor` class with `sanitize_payload(payload, tool_name) -> (dict, list[str])` — validates payload against `EnterpriseToolPayload`, recursively walks the dict/list tree redacting any key whose lowercase form is in `PII_FIELD_NAMES` with `[REDACTED_BY_POLICY]`, returns the mutated dict and a list of dot-notation redacted key paths; `parse_and_sanitize(raw_json, tool_name) -> (dict, list[str])` convenience wrapper that handles `json.loads` and raises `GovernanceError` on `JSONDecodeError` or non-dict JSON types.
+- `app/governance/audit.py` — `AuditLogger` class; `log_event(original, sanitized, tool_name, redacted_keys)` appends one JSONL entry to `data/audit.jsonl` containing `timestamp` (ISO-8601 UTC), `tool_name`, `redacted_keys`, `original_payload` (raw PII), `sanitized_payload`; auto-creates `data/` directory on first write (`os.makedirs(exist_ok=True)`); raises `GovernanceError` on write failure to block the workflow from proceeding without an audit trail; Windows-compatible (`mode='a'`, no `fcntl`); `ensure_ascii=False` + `default=str` for unicode safety.
+- `data/.gitkeep` — Ensures the `data/` runtime directory is tracked by git without committing actual audit data.
+- `app/core/config.py` — `AUDIT_LOG_PATH: str = "data/audit.jsonl"` governance config field (env-overridable); `GOVERNANCE_ENABLED: bool = True` kill-switch for bypassing the interceptor in local development via `.env`.
+
+### Changed
+- `app/worker/queue_tasks.py` — Module docstring updated to v1.0.0; Phase 2 section added documenting interceptor architecture, `[GOVERNANCE_INTERCEPT]` telemetry tag, and `GovernanceError` fault routing; `settings` and `GovernanceInterceptor`, `AuditLogger`, `GovernanceError` imports added; `process_workflow` now instantiates `GovernanceInterceptor()` and `AuditLogger()` once per workflow run alongside `LLMEngine()`; after `_run_llm_step()` returns for `EXTRACT_JSON` and `CUSTOM_PROMPT` steps (guarded by `settings.GOVERNANCE_ENABLED`), calls `interceptor.parse_and_sanitize()`, emits `[GOVERNANCE_INTERCEPT]` `WARNING`-level log if `redacted_keys` is non-empty, calls `audit_logger.log_event()`, replaces `output` with the sanitized JSON string before chaining to the next step; `GovernanceError` propagates naturally through the existing `except (..., Exception)` catch-all, which re-raises for RQ retry and DLQ routing without special-casing.
+- `app/core/config.py` — Module docstring updated with Phase 2 MCP Governance section.
+- `.gitignore` — `data/audit.jsonl` added to prevent PII-containing audit logs from entering source control.
+
 ---
 
 ## [v0.6.1] — 2026-09-04 (patch 2)

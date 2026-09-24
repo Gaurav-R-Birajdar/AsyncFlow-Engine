@@ -1,5 +1,5 @@
 """
-AsyncFlow Engine — RQ Background Worker Tasks (v0.6.1: Fatal-raise fix).
+AsyncFlow Engine — RQ Background Worker Tasks (v1.0.0: MCP Governance Interceptor).
 
 This module defines the functions that RQ workers deserialise from Redis
 and execute in a separate process.  Functions here MUST be:
@@ -26,10 +26,26 @@ Phase 2 — Retry + DLQ (v0.5.0):
 
   This module focuses on step-level retry (``retry_on_failure`` per step)
   and emits lifecycle telemetry at every stage:
-    [QUEUED]      — logged by the submit route when the job enters the queue.
-    [PROCESSING]  — logged here when process_workflow() starts executing.
-    [RETRYING]    — logged here when a step is retried after failure.
-    [DLQ-SENT]    — logged in dlq.route_to_dlq() after final job failure.
+    [QUEUED]              — logged by the submit route when the job enters the queue.
+    [PROCESSING]          — logged here when process_workflow() starts executing.
+    [RETRYING]            — logged here when a step is retried after failure.
+    [DLQ-SENT]            — logged in dlq.route_to_dlq() after final job failure.
+    [GOVERNANCE_INTERCEPT]— logged here when PII is detected and redacted (Phase 2).
+
+Phase 2 — MCP Governance Interceptor (v1.0.0):
+  For EXTRACT_JSON and CUSTOM_PROMPT steps (the only step types that produce
+  structured JSON), the raw LLM output is intercepted *before* it is chained
+  to the next step.  The ``GovernanceInterceptor`` evaluates the payload
+  against the enterprise PII policy (see ``app/governance/interceptor.py``),
+  redacts sensitive fields in-place, and then ``AuditLogger`` writes an
+  append-only JSONL record to ``data/audit.jsonl``.
+
+  If the interceptor crashes (un-parseable JSON or schema error), it raises
+  ``GovernanceError`` which is caught by the existing except-all handler,
+  activating the standard exponential backoff + DLQ routing.
+
+  Bypass: set ``GOVERNANCE_ENABLED=false`` in ``.env`` to skip interception
+  for local development without touching source code.
 
 Fault model:
   Step-level (within this module):
@@ -38,6 +54,7 @@ Fault model:
     - ``LLMTimeoutError``           → step FAILED (retry_on_failure re-attempts); if step
                                       retries exhausted, **exception RE-RAISED** for RQ retry.
     - ``LLMMalformedResponseError`` → same as LLMTimeoutError.
+    - ``GovernanceError``           → same as LLMMalformedResponseError (re-raised for RQ retry).
     - Any other ``Exception``       → step FAILED; **exception RE-RAISED** for RQ retry.
 
   Job-level (RQ Retry + DLQ):
@@ -62,6 +79,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from app.core.config import settings
 from app.core.schemas import (
     StepResult,
     StepStatus,
@@ -69,6 +87,8 @@ from app.core.schemas import (
     WorkflowSubmitRequest,
     WorkflowStep,
 )
+from app.governance.audit import AuditLogger
+from app.governance.interceptor import GovernanceError, GovernanceInterceptor
 from app.worker.engine import (
     LLMConnectionError,
     LLMEngine,
@@ -207,6 +227,11 @@ def process_workflow(request_dict: dict[str, Any]) -> dict[str, Any]:
 
     # One engine instance per workflow — Ollama is stateless between calls
     engine = LLMEngine()
+    # One interceptor + audit logger per workflow — shared across all steps.
+    # Instantiated here (not at module level) so per-run config (e.g. a test
+    # override of AUDIT_LOG_PATH) is respected without restarting the worker.
+    interceptor = GovernanceInterceptor()
+    audit_logger = AuditLogger()
     step_results: list[dict[str, Any]] = []
     current_input: str = request.input_text  # Seed text for the first step
 
@@ -236,6 +261,46 @@ def process_workflow(request_dict: dict[str, Any]) -> dict[str, Any]:
             attempt += 1
             try:
                 output = _run_llm_step(engine, step, step_input)
+
+                # ---------------------------------------------------------
+                # Phase 2: MCP Governance Interceptor
+                # Only EXTRACT_JSON and CUSTOM_PROMPT steps produce JSON.
+                # Other task types (summarize, translate, etc.) return plain
+                # text — no PII schema applies, skip interception.
+                # ---------------------------------------------------------
+                _json_producing_types = {TaskType.EXTRACT_JSON, TaskType.CUSTOM_PROMPT}
+                if (
+                    settings.GOVERNANCE_ENABLED
+                    and step.config.task_type in _json_producing_types
+                ):
+                    original_output = output  # preserve raw for audit trail
+                    sanitized_dict, redacted_keys = interceptor.parse_and_sanitize(
+                        raw_json=output,
+                        tool_name=step.step_id,
+                    )
+
+                    if redacted_keys:
+                        # Telemetry: [GOVERNANCE_INTERCEPT] — PII was detected and redacted.
+                        logger.warning(
+                            "[GOVERNANCE_INTERCEPT] Step '%s' — %d PII field(s) redacted: %s",
+                            step.step_id,
+                            len(redacted_keys),
+                            redacted_keys,
+                        )
+
+                    # Always write audit event for intercepted steps so the
+                    # compliance log reflects every governance check, not just
+                    # the ones that found PII.
+                    audit_logger.log_event(
+                        original=json.loads(original_output),
+                        sanitized=sanitized_dict,
+                        tool_name=step.step_id,
+                        redacted_keys=redacted_keys,
+                    )
+
+                    # Replace raw LLM output with the sanitized version so the
+                    # next step in the chain never sees unredacted PII.
+                    output = json.dumps(sanitized_dict, ensure_ascii=False, indent=2)
 
                 result.status = StepStatus.COMPLETED
                 result.output = output
